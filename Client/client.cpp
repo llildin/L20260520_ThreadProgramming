@@ -1,18 +1,14 @@
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
+Ôªø#define _WINSOCK_DEPRECATED_NO_WARNINGS
 
-
-#include "ChatPacket.h"
 #include "NetUtil.h"
 
-#include <winsock2.h>
 #include <Windows.h>
 #include <iostream>
 #include <process.h>
 #include <conio.h>
 #include "SDL.h"
-
-
-
+#include <mutex>
+#include <queue>
 
 #pragma comment(lib, "ws2_32")
 #pragma comment(lib, "NetCommon")
@@ -22,123 +18,247 @@
 
 using namespace std;
 
-char SendBuffer[1024] = { 0, };
-char RecvBuffer[1024] = { 0, };
+char RecvBuffer[65536] = { 0, };
 
 bool IsRecvThreadRunning = true;
 bool IsSendThreadRunning = true;
-bool IsRenderThreadRunning = false;
-
-SDL_Window* MyWindow;
-SDL_Renderer* MyRender;
 
 //ActorList
 SessionManager MySessionManager;
 SOCKET MyClientID;
 
-#define SIZE		50
-
-//void Render()
-//{
-//	system("cls");
-//
-//	for (auto Player : MySessionManager.SessionList)
-//	{
-//		COORD Where;
-//		Where.X = Player.X;
-//		Where.Y = Player.Y;
-//		SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), Where);
-//		std::cout << (char)Player.Shape << endl;
-//	}
-//}
-
-//unsigned WINAPI Render(void* Argument)
-//{
-//	while (true)
-//	{
-//		while (IsRenderThreadRunning)
-//		{
-//			SDL_Event MyEvent;
-//			SDL_PollEvent(&MyEvent);
-//
-//			for (auto Player : MySessionManager.SessionList)
-//			{
-//				SDL_Rect MyRect = { Player.X, Player.Y, 20, 20 };
-//				SDL_SetRenderDrawColor(MyRender, 255, 255, 255, 255);
-//				SDL_RenderClear(MyRender);
-//
-//				SDL_SetRenderDrawColor(MyRender, Player.R, Player.G, Player.B, 255);
-//				SDL_RenderFillRect(MyRender, &MyRect);
-//			}
-//
-//			SDL_RenderPresent(MyRender);
-//		}
-//	}
-//
-//	return 0;
-//}
+SDL_Window* MyWindow;
+SDL_Renderer* MyRenderer;
 
 
-void ProcessPacket(SOCKET ProcessSocket, const char* InBuffer, const Header& InHeader)
+std::mutex SessionLock;
+std::mutex KeyBufferLock;
+
+
+void Render();
+void ProcessPacket(SOCKET ProcessSocket, const char* InBuffer);
+unsigned WINAPI RecvThread(void* Argument);
+unsigned WINAPI SendThread(void* Argument);
+
+//queue
+std::queue<int> KeyBuffer;
+//KeyBuffer -> PacketBuffer
+
+int SDL_main(int Argc, char* Argv[])
 {
-	switch ((EPacketType)InHeader.PacketType)
+	//Object ÎèôÍ∏∞Ìôî(Lock, Lockfree)
+	//GameThread(Render)
+	//NetworkThread
+
+	std::cout << "client " << endl;
+
+	WSAData wsaData;
+
+	WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+	SDL_Init(SDL_INIT_EVERYTHING);
+	MyWindow = SDL_CreateWindow("SDL", 100, 100, 640, 480, SDL_WINDOW_OPENGL);
+	MyRenderer = SDL_CreateRenderer(MyWindow, -1, SDL_RENDERER_ACCELERATED || SDL_RENDERER_PRESENTVSYNC || SDL_RENDERER_TARGETTEXTURE);
+
+
+	SOCKET ServerSocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+	SOCKADDR_IN ServerSockAddr;
+	memset(&ServerSockAddr, 0, sizeof(ServerSockAddr));
+	ServerSockAddr.sin_family = AF_INET;
+	ServerSockAddr.sin_addr.s_addr = inet_addr("192.168.0.95");
+	ServerSockAddr.sin_port = htons(35000);
+
+	connect(ServerSocket, (SOCKADDR*)&ServerSockAddr, sizeof(ServerSockAddr));
+
+	std::cout << "client connect" << endl;
+
+	//memory(Data) -> ByteArray(char []) -> Serialize(flatbuffer)
+	flatbuffers::FlatBufferBuilder SendBuilder;
+	auto C2S_LoginData = UserPacket::CreateC2S_Login(
+		SendBuilder,
+		SendBuilder.CreateString("junios"),
+		SendBuilder.CreateString("1as3f356dsd6gyhg")
+	);
+
+	auto UserPacketData = UserPacket::CreatePacketData(
+		SendBuilder,
+		UserPacket::PacketType_C2S_Login,
+		C2S_LoginData.Union()
+	);
+
+	SendBuilder.Finish(UserPacketData);
+
+	SendAll(ServerSocket, SendBuilder);
+
+	HANDLE ThreadHandles[2] = { 0, };
+
+	ThreadHandles[0] = (HANDLE)_beginthreadex(0, 0, RecvThread, &ServerSocket, 0, 0);
+	ThreadHandles[1] = (HANDLE)_beginthreadex(0, 0, SendThread, &ServerSocket, 0, 0);
+
+
+	const Uint8* KeyState = SDL_GetKeyboardState(NULL);
+
+	while (true)
 	{
-	case EPacketType::S2C_Login:
+		SDL_Event MyEvent;
+		SDL_PollEvent(&MyEvent);
+		if (MyEvent.type == SDL_QUIT)
 		{
-			S2C_Login LoginPacket;
-			LoginPacket.Parse(InBuffer);
-			//std::cout << LoginPacket.ToString() << endl;
-			MyClientID = LoginPacket.ClientSocketID;
+			IsRecvThreadRunning = false;
+			IsSendThreadRunning = false;
+			break;
 		}
-		break;
-	case EPacketType::S2C_Spawn:
+		else if (MyEvent.type == SDL_KEYDOWN)
 		{
-			S2C_Spawn SpawnData;
-			SpawnData.Parse(InBuffer);
-			//std::cout << SpawnData.ToString() << endl;
-
-			Session InSession;
-			InSession.ClientSocket = SpawnData.ClientSocket;
-			InSession.Shape = SpawnData.Shape;
-			InSession.X = SpawnData.X;
-			InSession.Y = SpawnData.Y;
-			InSession.R = SpawnData.R;
-			InSession.G = SpawnData.G;
-			InSession.B = SpawnData.B;
-
-			MySessionManager.Add(InSession);
-
-			IsRenderThreadRunning = true;
+			if (KeyState[SDL_SCANCODE_ESCAPE])
+			{
+				IsRecvThreadRunning = false;
+				IsSendThreadRunning = false;
+				break;
+			}
+			int KeyCode = 0;
+			if (KeyState[SDL_SCANCODE_W])
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				KeyBuffer.push('W');
+			}
+			if (KeyState[SDL_SCANCODE_S])
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				KeyBuffer.push('S');
+			}
+			if (KeyState[SDL_SCANCODE_A])
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				KeyBuffer.push('A');
+			}
+			if (KeyState[SDL_SCANCODE_D])
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				KeyBuffer.push('D');
+			}
 		}
-		break;
-	case EPacketType::S2C_Move:
+
+		Render();
+	}
+
+	//blocking
+	WaitForMultipleObjects(2, ThreadHandles, FALSE, INFINITE);
+
+	closesocket(ServerSocket);
+
+	cout << "End Thread" << endl;
+
+	//TerminateThread(ThreadHandles[0], 0);
+	//TerminateThread(ThreadHandles[1], 0);
+	IsSendThreadRunning = false;
+	IsRecvThreadRunning = false;
+
+
+	CloseHandle(ThreadHandles[0]);
+	CloseHandle(ThreadHandles[1]);
+
+	WSACleanup();
+
+	SDL_DestroyWindow(MyWindow);
+	SDL_Quit();
+
+	return 0;
+}
+
+
+void Render()
+{
+	//system("cls");
+
+	//for (auto Player : MySessionManager.SessionList)
+	//{
+	//	COORD Where;
+	//	Where.X = Player.X;
+	//	Where.Y = Player.Y;
+	//	SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), Where);
+	//	std::cout << (char)Player.Shape << endl;
+	//}
+
+
+	SDL_SetRenderDrawColor(MyRenderer, 0, 0, 0, 0);
+	SDL_RenderClear(MyRenderer);
+
+	{
+		lock_guard<std::mutex> lock(SessionLock);
+		//SessionLock.lock();
+		for (auto Player : MySessionManager.SessionList)
 		{
-			S2C_Move MoveData;
-			MoveData.Parse(InBuffer);
-			Session* FindSession = MySessionManager.GetSession(MoveData.ClientSocket);
-			FindSession->X = MoveData.X;
-			FindSession->Y = MoveData.Y;
-
-			//std::cout << MoveData.ToString() << endl;
+			SDL_SetRenderDrawColor(MyRenderer, Player.R, Player.G, Player.B, 0);
+			SDL_Rect MyRect = { Player.X, Player.Y, 30, 30 };
+			SDL_RenderFillRect(MyRenderer, &MyRect);
 		}
-		break;
-	case EPacketType::S2C_Destroy:
-		{
-			S2C_Destroy DestroyPacket;
-			DestroyPacket.Parse(InBuffer);
-
-			Session* FindSession = MySessionManager.GetSession(DestroyPacket.ClientSocket);
-
-			//std::cout << "Quit : " << FindSession->ClientSocket << endl;
-
-			MySessionManager.Delete(*FindSession);
-
-		}
-		break;
+		//SessionLock.unlock();
 	}
 
 
+	SDL_RenderPresent(MyRenderer);
+
 }
+
+void ProcessPacket(SOCKET ProcessSocket, const char* InBuffer)
+{
+	auto UserPacketData = UserPacket::GetPacketData(InBuffer);
+
+	//std::cout << EnumNamePacketType(UserPacketData->data_type()) << std::endl;
+
+	switch (UserPacketData->data_type())
+	{
+	case UserPacket::PacketType_S2C_Login:
+	{
+		MyClientID = UserPacketData->data_as_S2C_Login()->client_socket_id();
+	}
+	break;
+	case UserPacket::PacketType_S2C_Spawn:
+	{
+		Session InSession;
+		auto SpawnData = UserPacketData->data_as_S2C_Spawn();
+		InSession.ClientSocket = SpawnData->client_socket_id();
+		InSession.Shape = SpawnData->shape();
+		InSession.X = SpawnData->position()->x();
+		InSession.Y = SpawnData->position()->y();
+		InSession.R = SpawnData->color()->r();
+		InSession.G = SpawnData->color()->g();
+		InSession.B = SpawnData->color()->b();
+
+		{
+			lock_guard<std::mutex> lock(SessionLock);
+			MySessionManager.Add(InSession);
+		}
+		//		Render();
+	}
+	break;
+	case UserPacket::PacketType_S2C_Move:
+	{
+		auto MoveData = UserPacketData->data_as_S2C_Move();
+
+		SOCKET SocketID = MoveData->client_socket_id();
+		Session* FindSession = MySessionManager.GetSession(SocketID);
+		FindSession->X = MoveData->position()->x();
+		FindSession->Y = MoveData->position()->y();
+	}
+	break;
+	case UserPacket::PacketType_S2C_Destroy:
+	{
+		auto DestroyPacket = UserPacketData->data_as_S2C_Destroy();
+
+		Session* FindSession = MySessionManager.GetSession((SOCKET)DestroyPacket->client_socket_id());
+		{
+			lock_guard<std::mutex> lock(SessionLock);
+			MySessionManager.Delete(*FindSession);
+		}
+	}
+	break;
+	}
+}
+
+
 
 unsigned WINAPI RecvThread(void* Argument)
 {
@@ -146,29 +266,15 @@ unsigned WINAPI RecvThread(void* Argument)
 
 	while (IsRecvThreadRunning)
 	{
-		unsigned short PacketSize = 0;
-
-		//header
-		Header DataHeader;
-		int RecvBytes = RecvAll(ServerSocket, (char*)&DataHeader, HeaderSize);
-		if (RecvBytes <= 0)
-		{
-			std::cout << "header recv fail " << endl;
-			break;
-		}
-
-		DataHeader.NetworkToHost();
-
 		memset(RecvBuffer, 0, sizeof(RecvBuffer));
-		//data JSON
-		RecvBytes = RecvAll(ServerSocket, RecvBuffer, DataHeader.PacketSize);
+		int RecvBytes = RecvAll(ServerSocket, RecvBuffer);
 		if (RecvBytes <= 0)
 		{
-			std::cout << "Data recv fail " << endl;
+			std::cout << "recv fail " << endl;
 			break;
 		}
 
-		ProcessPacket(ServerSocket, RecvBuffer, DataHeader);
+		ProcessPacket(ServerSocket, RecvBuffer);
 	}
 
 
@@ -177,178 +283,41 @@ unsigned WINAPI RecvThread(void* Argument)
 
 unsigned WINAPI SendThread(void* Argument)
 {
-	//√•¿”¿∫ ªÁøÎ«œ¥¬ ≥¿Ã ¡¯¥Ÿ.
+	//Ï±ÖÏûÑÏùÄ ÏÇ¨Ïö©ÌïòÎäî ÎÜàÏù¥ ÏßÑÎã§.
 	SOCKET ServerSocket = *(SOCKET*)Argument;
 
 	while (IsSendThreadRunning)
 	{
-		int KeyCode = _getch();
-
-		if (!(KeyCode == 'w' ||
-			KeyCode == 'W' ||
-			KeyCode == 'a' ||
-			KeyCode == 'A' ||
-			KeyCode == 's' ||
-			KeyCode == 'S' ||
-			KeyCode == 'd' ||
-			KeyCode == 'D'))
+		if (KeyBuffer.empty())
 		{
+			YieldProcessor();
+			//Sleep(0);
 			continue;
+
 		}
+		flatbuffers::FlatBufferBuilder SendBuilder;
 
-
-		C2S_Move MoveData;
-		MoveData.ClientSocket = MyClientID;
-		MoveData.Direction = KeyCode;
-
-
-		//header
-		Header DataHeader;
-		DataHeader.MakeHeader((int)(MoveData.ToString().length()), EPacketType::C2S_Move);
-		int SentBytes = SendAll(ServerSocket, (char*)&DataHeader, HeaderSize);
-		if (SentBytes <= 0)
+		flatbuffers::Offset<UserPacket::C2S_Move> C2S_MoveData;
 		{
-			std::cout << "header send fail." << endl;
+			lock_guard<std::mutex> KeyLock(KeyBufferLock);
+			C2S_MoveData = UserPacket::CreateC2S_Move(
+				SendBuilder,
+				(uint16_t)MyClientID,
+				KeyBuffer.front()
+			);
+			KeyBuffer.pop();
 		}
 
-		//Data
-		SentBytes = SendAll(ServerSocket, MoveData.ToString().c_str(), (int)(MoveData.ToString().length()));
-		if (SentBytes <= 0)
-		{
-			std::cout << "Data send fail." << endl;
-		}
-	
+		auto UserPacketData = UserPacket::CreatePacketData(
+			SendBuilder,
+			UserPacket::PacketType_C2S_Move,
+			C2S_MoveData.Union()
+		);
 
+		SendBuilder.Finish(UserPacketData);
+
+		SendAll(ServerSocket, SendBuilder);
 	}
-
-	return 0;
-}
-
-
-int SDL_main(int argc, char* argv[])
-{
-	SDL_Init(SDL_INIT_EVERYTHING);
-	MyWindow = SDL_CreateWindow("Client", 100, 100, 500, 500, SDL_WINDOW_SHOWN);
-	MyRender = SDL_CreateRenderer(MyWindow, -1, 0);
-
-	std::cout << "client " << endl;
-
-	WSAData wsaData;
-	WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-	SOCKET ServerSocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-	SOCKADDR_IN ServerSockAddr;
-	memset(&ServerSockAddr, 0, sizeof(ServerSockAddr));
-	ServerSockAddr.sin_family = AF_INET;
-	ServerSockAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-	ServerSockAddr.sin_port = htons(35000);
-
-	connect(ServerSocket, (SOCKADDR*)&ServerSockAddr, sizeof(ServerSockAddr));
-
-	std::cout << "client connect" << endl;
-
-	C2S_Login LoginData;
-	LoginData.UserID = "junios";
-	LoginData.HashKey = "1as3f356dsd6gyhg";
-
-	Header LoginHeader;
-	LoginHeader.MakeHeader(static_cast<unsigned short>(LoginData.ToString().length()), EPacketType::C2S_Login);
-
-	//Login ø‰√ª
-	if (SendAll(ServerSocket, (char*)&LoginHeader, HeaderSize) <= 0)
-	{
-		std::cout << "login header Error" << endl;
-	}
-
-	if (SendAll(ServerSocket, LoginData.ToString().c_str(), (int)LoginData.ToString().length()) <= 0)
-	{
-		std::cout << "login data Error" << endl;
-	}
-
-	HANDLE ThreadHandles[2] = { 0, };
-
-	ThreadHandles[0] = (HANDLE)_beginthreadex(0, 0, RecvThread, &ServerSocket, 0, 0);
-	ThreadHandles[1] = (HANDLE)_beginthreadex(0, 0, SendThread, &ServerSocket, 0, 0);
-
-	bool Running = true;
-	while (Running)
-	{
-		SDL_Event MyEvent;
-		SDL_PollEvent(&MyEvent);
-
-		SDL_Keycode KeyCode = MyEvent.key.keysym.sym;
-
-		if (MyEvent.type == SDL_QUIT)
-		{
-			Running = false;
-		}
-
-		if (MyEvent.type == SDL_KEYDOWN)
-		{
-			if (KeyCode == SDLK_ESCAPE)
-			{
-				Running = false;
-			}
-
-			if (!(KeyCode == 'w' ||
-				KeyCode == 'W' ||
-				KeyCode == 'a' ||
-				KeyCode == 'A' ||
-				KeyCode == 's' ||
-				KeyCode == 'S' ||
-				KeyCode == 'd' ||
-				KeyCode == 'D'))
-			{
-				continue;
-			}
-			C2S_Move MoveData;
-			MoveData.ClientSocket = MyClientID;
-			MoveData.Direction = KeyCode;
-
-			//header
-			Header DataHeader;
-			DataHeader.MakeHeader((int)(MoveData.ToString().length()), EPacketType::C2S_Move);
-			int SentBytes = SendAll(ServerSocket, (char*)&DataHeader, HeaderSize);
-			if (SentBytes <= 0)
-			{
-				std::cout << "header send fail." << endl;
-			}
-
-			//Data
-			SentBytes = SendAll(ServerSocket, MoveData.ToString().c_str(), (int)(MoveData.ToString().length()));
-			if (SentBytes <= 0)
-			{
-				std::cout << "Data send fail." << endl;
-			}
-		}
-
-		SDL_SetRenderDrawColor(MyRender, 255, 255, 255, 255);
-		SDL_RenderClear(MyRender);
-
-		for (auto& Player : MySessionManager.SessionList)
-		{
-			SDL_Rect MyRect = { Player.X * SIZE, Player.Y * SIZE, SIZE, SIZE };
-			SDL_SetRenderDrawColor(MyRender, Player.R, Player.G, Player.B, 255);
-			SDL_RenderFillRect(MyRender, &MyRect);
-		}
-
-		SDL_RenderPresent(MyRender);
-		SDL_Delay(16);
-	}
-
-	IsSendThreadRunning = false;
-	IsRecvThreadRunning = false;
-	closesocket(ServerSocket);
-
-	WaitForMultipleObjects(2, ThreadHandles, TRUE, 2000);
-	CloseHandle(ThreadHandles[0]);
-	CloseHandle(ThreadHandles[1]);
-
-	SDL_DestroyRenderer(MyRender);
-	SDL_DestroyWindow(MyWindow);
-	SDL_Quit();
-	WSACleanup();
 
 	return 0;
 }

@@ -73,6 +73,7 @@ int SDL_main(int Argc, char* Argv[])
 
 	std::cout << "client connect" << endl;
 
+	//[][] [][][][] [][][][] 
 	//memory(Data) -> ByteArray(char []) -> Serialize(flatbuffer)
 	flatbuffers::FlatBufferBuilder SendBuilder;
 	auto C2S_LoginData = UserPacket::CreateC2S_Login(
@@ -137,6 +138,11 @@ int SDL_main(int Argc, char* Argv[])
 			{
 				lock_guard<std::mutex> KeyLock(KeyBufferLock);
 				KeyBuffer.push('D');
+			}
+			if (KeyState[SDL_SCANCODE_C])
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				KeyBuffer.push('C');
 			}
 		}
 
@@ -255,6 +261,20 @@ void ProcessPacket(SOCKET ProcessSocket, const char* InBuffer)
 		}
 	}
 	break;
+
+	case UserPacket::PacketType_S2C_ChangeColor:
+	{
+		auto ColorPacket = UserPacketData->data_as_S2C_ChangeColor();
+
+		{
+			lock_guard<std::mutex> lock(SessionLock);
+			Session* FindSession = MySessionManager.GetSession((SOCKET)ColorPacket->client_socket_id());
+			FindSession->R = ColorPacket->color()->r();
+			FindSession->G = ColorPacket->color()->g();
+			FindSession->B = ColorPacket->color()->b();
+		}
+	}
+	break;
 	}
 }
 
@@ -297,24 +317,48 @@ unsigned WINAPI SendThread(void* Argument)
 		}
 		flatbuffers::FlatBufferBuilder SendBuilder;
 
-		flatbuffers::Offset<UserPacket::C2S_Move> C2S_MoveData;
+		if (KeyBuffer.front() == 'C')
 		{
-			lock_guard<std::mutex> KeyLock(KeyBufferLock);
-			C2S_MoveData = UserPacket::CreateC2S_Move(
+			flatbuffers::Offset<UserPacket::C2S_ChangeColor> C2S_ColorData;
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				C2S_ColorData = UserPacket::CreateC2S_ChangeColor(
+					SendBuilder,
+					(uint16_t)MyClientID
+				);
+				KeyBuffer.pop();
+			}
+
+			auto UserPacketData = UserPacket::CreatePacketData(
 				SendBuilder,
-				(uint16_t)MyClientID,
-				KeyBuffer.front()
+				UserPacket::PacketType_C2S_ChangeColor,
+				C2S_ColorData.Union()
 			);
-			KeyBuffer.pop();
+
+			SendBuilder.Finish(UserPacketData);
+		}
+		else
+		{
+			flatbuffers::Offset<UserPacket::C2S_Move> C2S_MoveData;
+			{
+				lock_guard<std::mutex> KeyLock(KeyBufferLock);
+				C2S_MoveData = UserPacket::CreateC2S_Move(
+					SendBuilder,
+					(uint16_t)MyClientID,
+					KeyBuffer.front()
+				);
+				KeyBuffer.pop();
+			}
+
+			auto UserPacketData = UserPacket::CreatePacketData(
+				SendBuilder,
+				UserPacket::PacketType_C2S_Move,
+				C2S_MoveData.Union()
+			);
+
+			SendBuilder.Finish(UserPacketData);
 		}
 
-		auto UserPacketData = UserPacket::CreatePacketData(
-			SendBuilder,
-			UserPacket::PacketType_C2S_Move,
-			C2S_MoveData.Union()
-		);
-
-		SendBuilder.Finish(UserPacketData);
 
 		SendAll(ServerSocket, SendBuilder);
 	}
